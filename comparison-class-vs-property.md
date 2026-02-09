@@ -2,69 +2,164 @@
 
 ## 結論
 
-ユーザーの分析は**おおむね正確**ですが、いくつかの重要な訂正と追加事項があります。
+ユーザーの分析は多くの点で正しいが、いくつかの誤解がある。また、**致命的なバグ**と**Test Runnerへの影響**という重要な発見があった。
 
 ---
 
 ## 検証結果サマリー
 
-| ユーザーの主張 | 検証結果 | 備考 |
+| ユーザーの主張 | 検証結果 | 根拠 |
 |--------------|---------|------|
-| Widget.jsからクラス方式で保存可能 | **正しい** | `addClass()`→`attr()`→`editable mixin`→`attributeChange.qti-widget`→自動保存 |
-| Widget.jsからプロパティ方式で保存不可 | **誤り** | `prop()`も保存可能。ただし`attributeChange`イベントではなく別の経路 |
+| Widget.jsからクラス方式で保存可能 | **正しい** | `addClass()`→`attr()`→editable mixinが`attributeChange.qti-widget`イベント発火（ソースコード確認済み） |
+| Widget.jsからプロパティ方式で保存不可 | **正しい（部分的に）** | `prop()`はイベントを発火しない。手動Save時に保存されるが「即座の保存」ではない |
 | Question.jsから両方式で保存可能 | **正しい** | |
 | アイテム変更時のクラス方式の自動同期 | **正しい** | |
-| アイテム変更時のプロパティ方式の同期不可 | **誤り** | Widget.jsで`prop('writingMode', undefined)`は可能で、保存もされる |
+| アイテム変更時のプロパティ方式の同期不可 | **正しい（さらに深刻）** | `prop('writingMode', undefined)`は削除ではなく**getter**として動作する（後述） |
 | 標準インタラクションとの一貫性はクラス方式 | **正しい** | |
-| 既存PCIはプロパティを使用 | **ほぼ正しい** | 1つだけ例外あり（audioRecordingInteraction） |
+| 既存PCIはプロパティを使用 | **ほぼ正しい** | 1つだけ例外あり（audioRecordingInteraction IMS版がclassを使用） |
 
 ---
 
-## 1. 重要な訂正: Widget.jsからプロパティ方式でも保存可能
+## 1. `prop()` vs `attr()` の保存メカニズム（ソースコード根拠）
 
-ユーザーの分析では「Widget.jsからプロパティ方式で保存不可」としていますが、これは**誤り**です。
+### `attr()` の保存経路
 
-### 実際の動作
-
-`prop()`メソッドもWidget.jsから呼び出し可能であり、プロパティの変更は保存されます。
-
-既に調査ドキュメント `investigation-writing-mode-persistence.md` にも、Widget.jsでの実装例が記載されています：
+**ソース:** `extension-tao-itemqti/views/js/qtiCreator/model/mixin/editable.js`
 
 ```javascript
+// editable mixin が attr() をオーバーライド
+attr: function (key, value) {
+    const ret = this._super(key, value);
+    if (typeof key !== 'undefined' && typeof value !== 'undefined') {
+        $(document).trigger('attributeChange.qti-widget', {
+            element: this,
+            key: key,
+            value: entity.encode(value)
+        });
+    }
+    return _.isString(ret) ? entity.decode(ret) : ret;
+},
+```
+
+`addClass()` → `attr('class', ...)` → editable mixinのオーバーライド → `attributeChange.qti-widget`イベント発火
+
+### `prop()` の保存経路
+
+**ソース:** `tao-item-runner-qti-fe/src/qtiItem/mixin/CustomElement.js`
+
+```javascript
+prop: function (name, value) {
+    if (name) {
+        if (value !== undefined) {
+            this.properties[name] = value;   // ← イベント発火なし、サイレントに書き込み
+        } else {
+            if (typeof name === 'object') {
+                for (var prop in name) {
+                    this.prop(prop, name[prop]);
+                }
+            } else if (typeof name === 'string') {
+                if (this.properties[name] === undefined) {
+                    return undefined;
+                } else {
+                    return this.properties[name];  // ← getter として動作
+                }
+            }
+        }
+    }
+    return this;
+},
+```
+
+- `prop()`は**いかなるイベントも発火しない**
+- editable mixin は `prop()` を**オーバーライドしていない**（`attr`, `removeAttr`, `remove`のみ）
+- 保存は手動Save時（`ItemWidget.save()`でモデル全体をXMLシリアライズ）にのみ発生
+
+### 重要: `attributeChange.qti-widget` は自動保存イベントではない
+
+このイベントはウィジェットUI更新のために使用され、ファイルへの永続化をトリガーするものではない。ただし、`attr()`呼び出しでモデルが変更された事実はchangeTrackerに検知され、ユーザーが画面を離れる際に「保存しますか？」ダイアログが表示される。
+
+**結果: どちらの方式も、最終的な永続化はユーザーの手動Save時にのみ行われる。**
+
+しかし、`attr()`経由の変更はイベントを発火するため、他のウィジェットやプラグインがリアクションできる。`prop()`はサイレントなので、他のコンポーネントは変更に気づけない。
+
+---
+
+## 2. 致命的なバグ: `prop('writingMode', undefined)` は削除ではなくgetter
+
+### 問題のコードパス
+
+```javascript
+self.element.prop('writingMode', undefined);
+```
+
+このコードは一見プロパティを削除するように見えるが、実際には：
+
+```javascript
+prop: function (name, value) {
+    if (name) {                          // 'writingMode' → truthy → YES
+        if (value !== undefined) {        // undefined !== undefined → FALSE
+            // ← ここはスキップされる！
+        } else {
+            // ← こちらに入る
+            if (typeof name === 'string') {
+                return this.properties[name];  // ← getter として現在の値を返すだけ
+            }
+        }
+    }
+}
+```
+
+**`value`が`undefined`の場合、`value !== undefined`は`false`になり、setter経路に入らず、getter経路に入る。プロパティは一切変更されない。**
+
+### プロパティを実際に削除するには
+
+```javascript
+// 方法1: 直接delete
+delete self.element.properties['writingMode'];
+
+// 方法2: removeProp() → ただしバグあり（attributesを削除してしまう）
+// self.element.removeProp('writingMode');  // ← 使ってはいけない
+```
+
+`removeProp()`のバグ（ソース: `CustomElement.js`）:
+```javascript
+removeProp: function (propNames) {
+    _.forEach(propNames, function (propName) {
+        delete _this.attributes[propName];  // ← BUG: properties ではなく attributes を削除
+    });
+},
+```
+
+### 影響
+
+調査ドキュメント `investigation-writing-mode-persistence.md` に記載されている以下のコードは**動作しない**：
+
+```javascript
+// Widget.js での想定実装
 $itemBody.on('item-writing-mode-changed', function() {
-    self.element.prop('writingMode', undefined);
+    self.element.prop('writingMode', undefined);  // ← 何もしない（getter）
 });
 ```
 
-**つまり、プロパティ方式でもアイテム変更時の自動同期は可能です。**
+プロパティ方式を採用する場合、以下のように書く必要がある：
 
-### 保存経路の違い
-
-| 方式 | 保存経路 |
-|------|---------|
-| クラス方式 | `addClass()`→`attr('class', ...)`→`editable mixin`の`attr()`→`attributeChange.qti-widget`イベント発火→自動保存 |
-| プロパティ方式 | `prop()`→`this.properties[name] = value`→（保存トリガーは別経路） |
-
-プロパティの変更がどの経路で保存されるかは、`prop()`メソッド自体は`attributeChange.qti-widget`イベントを発火しません。しかし、QTI Creatorはアイテムのモデル全体をシリアライズするため、保存アクション（Ctrl+S等）の際にプロパティも含めてXMLに出力されます。
+```javascript
+$itemBody.on('item-writing-mode-changed', function() {
+    delete self.element.properties['writingMode'];  // ← 直接delete
+});
+```
 
 ---
 
-## 2. 重要な追加事項: Test Runnerの高さ計算への影響
+## 3. Test Runnerの高さ計算への影響
 
-**ユーザーの分析に欠けている最も重要なポイント**です。
+**ユーザーの分析に欠けている重要なポイント。**
 
 ### Test Runnerの writing-mode 検出方法
 
-`tao-test-runner-qti-fe/src/helpers/verticalWriting.js` は**CSSクラスのみ**で writing-mode を検出します：
+**ソース:** `tao-test-runner-qti-fe/src/helpers/verticalWriting.js`
 
 ```javascript
-// アイテム全体の判定
-export const getIsItemWritingModeVerticalRl = () => {
-    const itemBody = $('.qti-itemBody');
-    return itemBody.hasClass('writing-mode-vertical-rl');
-};
-
-// 特定要素の判定
 export const getIsWritingModeVerticalRl = $container => {
     const $writingModeParent = $container.closest(
         '.writing-mode-vertical-rl, .writing-mode-horizontal-tb'
@@ -76,16 +171,11 @@ export const getIsWritingModeVerticalRl = $container => {
 };
 ```
 
-### プロパティ方式の問題
+**CSSクラスのみで検出する。PCIプロパティは参照しない。**
 
-| シナリオ | クラス方式 | プロパティ方式 |
-|---------|----------|--------------|
-| PCIが縦書き（アイテムは横書き） | `class="writing-mode-vertical-rl"` → Test Runnerが検出 → 正しい高さ計算 | プロパティのみ → Test Runnerが検出**できない** → 誤った高さ計算 |
-| PCIが横書き（アイテムは縦書き） | `class="writing-mode-horizontal-tb"` → Test Runnerが検出 → 正しい高さ計算 | プロパティのみ → Test Runnerが検出**できない** → 誤った高さ計算 |
+### 影響
 
-### 具体的な影響
-
-`itemScrolling.js`の`adaptBlockSize()`関数は、ブロック要素の writing-mode を判定して適用するCSSプロパティを決定します：
+`itemScrolling.js`の`adaptBlockSize()`でブロック要素のwriting-modeを判定する際：
 
 ```javascript
 const isBlockVerticalWriting = getIsWritingModeVerticalRl($block);
@@ -93,188 +183,121 @@ const isDifferentWritingMode = isBlockVerticalWriting !== isItemVerticalWriting;
 const sizeProp = isDifferentWritingMode ? normalSizeProp : maxSizeProp;
 ```
 
-| アイテム | ブロック | 正しいCSS | クラスなし時のCSS |
-|---------|---------|----------|----------------|
-| 横書き | 縦書き | `height` | `max-height`（誤り） |
-| 縦書き | 横書き | `width` | `max-width`（誤り） |
+| シナリオ | クラス方式 | プロパティ方式 |
+|---------|----------|--------------|
+| PCIが縦書き（アイテムは横書き） | `class="writing-mode-vertical-rl"` → 検出される → `height`（正しい） | クラスなし → 検出されない → `max-height`（**誤り**） |
+| PCIが横書き（アイテムは縦書き） | `class="writing-mode-horizontal-tb"` → 検出される → `width`（正しい） | クラスなし → 検出されない → `max-width`（**誤り**） |
 
-**プロパティ方式ではクラスが付与されないため、Test Runnerがwriting-modeの違いを検出できず、高さ計算が誤る可能性があります。**
-
-### プロパティ方式でこの問題を解決するには
-
-プロパティ方式を採用する場合、以下のいずれかの対応が必要：
-
-1. **Question.jsでプロパティに応じてクラスも付与する** → 実質的にクラス方式との併用
-2. **Test Runner側にPCIプロパティの読み取りロジックを追加する** → Test Runnerの改修が必要
-3. **PCI内部のrenderingでクラスを付与する** → Test Runner実行時のHTML出力時にクラスを含める
+**プロパティ方式では、アイテムと異なるwriting-modeを持つPCIの高さ計算が誤る。**
 
 ---
 
-## 3. 既存PCIの設定保存パターン（調査結果）
+## 4. 既存PCIの設定保存パターン（調査結果）
 
-### 調査対象
+**ソース:** `extension-tao-itemqti-pci` リポジトリの実コード
 
-`extension-tao-itemqti-pci` リポジトリ内の既存PCI：
-
-| PCI | 設定の保存方法 |
-|-----|--------------|
-| likertScoreInteraction | **プロパティ** (`prop('level', value)`) |
-| likertCompact | **プロパティ** |
-| likertConfig | **プロパティ** |
-| mathEntryInteraction | **プロパティ** (`prop(name, value)`) |
-| audioRecordingInteraction (IMS版) | **クラス + プロパティ** (`toggleClass('sequential', value)`) |
-| audioRecordingInteraction (dev版) | **プロパティのみ** |
-| liquidsInteraction | **プロパティ** |
-
-### 結論
+| PCI | 設定の保存方法 | 根拠 |
+|-----|--------------|------|
+| likertScoreInteraction | **プロパティ** | `interaction.prop('level', value)` |
+| likertCompact | **プロパティ** | |
+| likertConfig | **プロパティ** | |
+| mathEntryInteraction | **プロパティ** | `interaction.prop(name, value)` |
+| audioRecordingInteraction (IMS版) | **クラス + プロパティ** | `interaction.toggleClass('sequential', value)` |
+| audioRecordingInteraction (dev版) | **プロパティのみ** | |
+| liquidsInteraction | **プロパティ** | |
 
 - **ほぼ全てのPCIがプロパティ方式を使用**
 - **唯一の例外**: audioRecordingInteraction (IMS版) が `sequential` フラグに `toggleClass()` を使用
-- ただし、これは writing-mode のような視覚的なCSS設定ではなく、動作制御フラグ
+- これは writing-mode のような視覚的CSS設定ではなく、動作制御フラグ
 
 ---
 
-## 4. QTI XMLシリアライゼーションの検証
+## 5. `attributeChange.qti-widget`イベントの確認
 
-### クラス方式の場合
+**ソース:** `extension-tao-itemqti/views/js/qtiCreator/model/mixin/editable.js`
 
-`customInteraction`のXMLテンプレート（`portableCustomInteraction/main.tpl`）：
+editable mixin がオーバーライドするメソッド：
+- `init`
+- `attr` ← `attributeChange.qti-widget` を発火
+- `removeAttr`
+- `remove`
 
-```handlebars
-<customInteraction {{{join attributes '=' ' ' ' '}}}}>
-    {{{portableCustomInteraction}}}
-</customInteraction>
+**`prop()` はオーバーライドされていない。** `propertyChange` のようなイベントも存在しない。
+
+**ソース:** イベントリスト（`event.js`）に `propertyChange` は含まれていない：
+```javascript
+var eventList = [
+    'containerBodyChange',
+    'containerElementAdded',
+    'elementCreated.qti-widget',
+    'attributeChange.qti-widget',    // ← attr() 用
+    'choiceCreated.qti-widget',
+    'correctResponseChange.qti-widget',
+    // ... propertyChange は存在しない
+];
 ```
-
-`{{{join attributes ...}}}` がすべてのattributesを出力するため、`class`属性も正しくXMLに含まれます。
-
-**出力例:**
-```xml
-<customInteraction responseIdentifier="RESPONSE" class="writing-mode-vertical-rl">
-    <pci:portableCustomInteraction ...>
-        ...
-    </pci:portableCustomInteraction>
-</customInteraction>
-```
-
-### 保存経路の確認
-
-```
-addClass('writing-mode-vertical-rl')
-    ↓
-Element.addClass() → this.attr('class', 'writing-mode-vertical-rl')
-    ↓
-editable mixin の attr() がオーバーライド
-    ↓
-$(document).trigger('attributeChange.qti-widget', { element, key: 'class', value })
-    ↓
-QTI XMLに自動保存
-```
-
-**`choiceInteraction`と完全に同じメカニズムです。** クラス方式は技術的に問題なく動作します。
 
 ---
 
-## 5. 修正された比較表
-
-### QTI XMLでの保存形式
-
-クラス方式:
-```xml
-<customInteraction class="writing-mode-vertical-rl" responseIdentifier="RESPONSE">
-    <pci:portableCustomInteraction>
-        ...
-    </pci:portableCustomInteraction>
-</customInteraction>
-```
-
-プロパティ方式:
-```xml
-<customInteraction responseIdentifier="RESPONSE">
-    <pci:portableCustomInteraction>
-        <pci:properties>
-            <pci:entry key="writingMode">vertical</pci:entry>
-        </pci:properties>
-    </pci:portableCustomInteraction>
-</customInteraction>
-```
-
-### 修正された技術的比較
+## 6. 修正された技術的比較
 
 | 観点 | クラス方式 | プロパティ方式 |
 |------|----------|--------------|
-| Widget.jsから保存 | 可能（`attributeChange`イベント経由） | 可能（モデルシリアライズ時に保存） |
+| Widget.jsからモデル変更 | 可能（`removeClass()`） | 可能だが`prop(name, undefined)`は**動作しない**。`delete properties[name]`が必要 |
+| 変更時のイベント発火 | **あり**（`attributeChange.qti-widget`） | **なし** |
+| 変更の永続化タイミング | 手動Save時 | 手動Save時 |
 | Question.jsから保存 | 可能 | 可能 |
-| アイテム変更時の自動同期 | 可能（`removeClass()`） | 可能（`prop(name, undefined)`） |
+| アイテム変更時の同期 | `removeClass()`で即座にモデル変更 | `delete properties[name]`で即座にモデル変更（ただしイベントなし） |
 | 標準インタラクションとの一貫性 | **同じ仕組み** | 異なる仕組み |
-| 既存PCIとの一貫性 | 一部例外あり | **ほぼ全てのPCIがこちら** |
-| Test Runnerでの writing-mode 検出 | **自動的に機能** | **機能しない**（追加対応が必要） |
+| 既存PCIとの一貫性 | 例外的（audioRecordingInteractionのみ） | **ほぼ全てのPCIがこちら** |
+| Test Runnerでのwriting-mode検出 | **自動的に機能** | **機能しない**（追加対応が必要） |
 | CSS継承 | **自然に機能** | PCI内部で別途対応が必要 |
 | PCI仕様への準拠 | グレー（属性は仕様外の拡張） | **準拠** |
+| プロパティ削除のAPI | `removeClass()`が正常動作 | `removeProp()`にバグ、`prop(name, undefined)`も動作しない |
 
 ---
 
-## 6. 修正された判断マトリクス
+## 7. 修正された判断マトリクス
 
 | 優先事項 | 推奨方式 | 理由 |
 |---------|---------|------|
-| 標準インタラクションと同じ動作 | クラス方式 | 同じメカニズム |
-| 既存PCIとの一貫性 | プロパティ方式 | ほぼ全てのPCIがプロパティを使用 |
-| 実装のシンプルさ | クラス方式 | CSS継承が自然に機能 |
-| アイテム変更時の即座同期 | **どちらも可能** | ~~クラス方式のみ~~ |
-| PCI仕様への準拠 | プロパティ方式 | |
+| 標準インタラクションと同じ動作 | **クラス方式** | 同じメカニズム |
+| 既存PCIとの一貫性 | **プロパティ方式** | ほぼ全てのPCIがプロパティを使用 |
+| 実装のシンプルさ | **クラス方式** | CSS継承が自然に機能、APIが正常動作 |
+| アイテム変更時の同期 | **クラス方式が優位** | `removeClass()`は正常動作+イベント発火。プロパティ方式は`delete`が必要でイベントなし |
+| PCI仕様への準拠 | **プロパティ方式** | |
 | Test Runnerの高さ計算 | **クラス方式** | プロパティ方式はTest Runner改修が必要 |
 | CSS自然継承 | **クラス方式** | プロパティ方式は別途CSS適用が必要 |
+| APIの信頼性 | **クラス方式** | `addClass/removeClass/toggleClass`は正常。`prop(undefined)`はgetter、`removeProp()`はバグあり |
 
 ---
 
-## 7. 最終的な見解
+## 8. 最終的な見解
 
-### クラス方式を推奨する理由（ユーザーの見解は正しい）
+### ユーザーの見解「クラス方式が望ましい」は正しい
 
-ユーザーの「技術的制約がなければクラス方式が望ましい」という見解は正しいです。加えて、以下の理由がさらにクラス方式を支持します：
+ソースコード調査により、クラス方式を支持する根拠がさらに強化された：
 
-1. **Test Runnerの高さ計算が正しく動作する** — `verticalWriting.js`がクラスを検出するため、追加改修不要
-2. **CSS継承が自然に機能する** — ブラウザの`writing-mode`プロパティ継承がそのまま使える
-3. **`audioRecordingInteraction`という前例がある** — PCI でクラス属性を使用した実績がある
-4. **保存メカニズムは標準インタラクションと完全に同じ** — `editable mixin`の`attr()`を通じて自動保存
+1. **Test Runnerの高さ計算** — `verticalWriting.js`がCSSクラスのみで検出するため、クラス方式でないとwriting-mode違いの高さ計算が誤る
+2. **APIの信頼性** — `addClass()`/`removeClass()`は正常動作するが、`prop(name, undefined)`はgetterとして動作するバグがあり、`removeProp()`にも別のバグがある
+3. **イベント連携** — `attr()`経由で`attributeChange.qti-widget`が発火するため、他コンポーネントとの連携が可能
+4. **audioRecordingInteraction** — PCIでクラス属性を使用した前例がある
 
-### ただし注意すべき点
+### ユーザーの分析への補足
 
-- **既存PCIの大半はプロパティ方式** — チーム内の慣例に反する可能性がある
-- **PCI仕様としては、設定はpropertiesに入れるのが正道** — classはPCI仕様が想定する設定保存場所ではない
-- **ハイブリッド方式の検討** — プロパティに保存しつつ、Question.jsやWidget.jsでクラスも付与する方式が最も安全かもしれない
+ユーザーの比較表「アイテム変更時の自動同期: クラス方式=可能、プロパティ方式=不可」は**おおむね正しい**。ただし、正確には：
 
-### ハイブリッド方式の例
+- クラス方式: `removeClass()`で**モデル変更 + イベント発火** → 正常動作
+- プロパティ方式: `delete properties[name]`で**モデル変更のみ（イベントなし）** → 動作はするが、`prop(name, undefined)`と書くと**何も起きない**
+
+### investigation-writing-mode-persistence.md の修正が必要
+
+当ドキュメントに記載されている以下のコードはバグがあるため修正が必要：
 
 ```javascript
-// Widget.js
-$itemBody.on('item-writing-mode-changed', function() {
-    // プロパティを削除
-    self.element.prop('writingMode', undefined);
-    // クラスも削除（Test Runner用）
-    self.element.removeClass('writing-mode-vertical-rl');
-    self.element.removeClass('writing-mode-horizontal-tb');
-});
+// ❌ 誤り: getter として動作する（プロパティは削除されない）
+self.element.prop('writingMode', undefined);
 
-// Question.js callbacks.writingMode
-if (mode === 'vertical' && !isItemVertical) {
-    interaction.prop('writingMode', 'vertical');
-    interaction.addClass('writing-mode-vertical-rl');
-    interaction.removeClass('writing-mode-horizontal-tb');
-} else if (mode === 'horizontal' && isItemVertical) {
-    interaction.prop('writingMode', 'horizontal');
-    interaction.addClass('writing-mode-horizontal-tb');
-    interaction.removeClass('writing-mode-vertical-rl');
-} else {
-    interaction.prop('writingMode', undefined);
-    interaction.removeClass('writing-mode-vertical-rl');
-    interaction.removeClass('writing-mode-horizontal-tb');
-}
+// ✅ 正しい: プロパティを直接削除
+delete self.element.properties['writingMode'];
 ```
-
-この方式なら：
-- PCIの慣例（プロパティ）に従う
-- Test Runnerの高さ計算が正しく動作する
-- CSS継承も機能する
-- ただし、二重管理のため整合性に注意が必要
