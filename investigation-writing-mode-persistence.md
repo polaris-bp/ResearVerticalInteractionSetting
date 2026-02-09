@@ -1,439 +1,226 @@
-# Writing-Mode 親子継承・上書き構造の調査レポート
+# Writing-Mode 継承メカニズム調査レポート
 
-## 問題の背景
+## 概要
 
-以下の構造を実現したいという要件があります：
-- **親（アイテム）の文字列方向設定が子（インタラクション）にも反映される**
-- **子の設定をしたときは子の設定のみが更新される**
-
-この「継承と上書き」の仕組みが標準インタラクションでどのように実現されているかを調査しました。
+標準インタラクション（choiceInteraction等）における文字列方向（writing-mode）設定の継承メカニズムを調査しました。
 
 ---
 
-## 調査結果の要約
+## 設定値の保存形式
 
-### 核心的な発見
+インタラクションのwriting-mode設定は**クラス属性**として保存されます。
 
-**設定値の保存方法:**
-- インタラクションのwriting-mode設定は「クラス属性」として保存される
-- `writing-mode-vertical-rl` → 縦書き（明示的設定）
-- `writing-mode-horizontal-tb` → 横書き（明示的設定）
-- **クラスなし** → アイテムの設定を継承（デフォルト）
-
-**アイテム変更時の動作:**
-- インタラクションに「アイテムの設定値をコピー」するのではない
-- インタラクションの「明示的設定を削除して継承させる」という設計
+| クラス属性 | 意味 |
+|-----------|------|
+| `class="writing-mode-vertical-rl"` | 明示的に縦書き |
+| `class="writing-mode-horizontal-tb"` | 明示的に横書き |
+| クラスなし | アイテムの設定を継承 |
 
 ---
 
-## 設定値の継承メカニズム詳細
+## 継承の仕組み
 
-### 1. 設定値の保存形式
+### 基本原則
+
+**「クラスなし」=「親（アイテム）に従う」**
+
+### 継承が機能する場所
+
+| 場所 | 機能 |
+|------|------|
+| CSS | `writing-mode`プロパティが親要素から子要素に継承される |
+| フォーム表示 | Question.jsがクラスを確認し、なければアイテムの設定を使用 |
+
+---
+
+## 処理フロー
+
+### 1. アイテムのwriting-modeが変更されたとき
 
 ```
-インタラクションの設定状態:
-├─ class="writing-mode-vertical-rl"  → 明示的に縦書き
-├─ class="writing-mode-horizontal-tb" → 明示的に横書き
-└─ class=""（またはclass属性なし）    → アイテムの設定を継承
-```
-
-### 2. アイテム変更時の処理フロー
-
-```
-ユーザーがアイテムのwriting-modeを変更
+ユーザーがアイテムの設定を変更
     ↓
-Active.js: $itemBody.trigger('item-writing-mode-changed')
+Active.js: イベント発火
+    $itemBody.trigger('item-writing-mode-changed')
     ↓
-Widget.js: イベントを受信
-    ↓
-インタラクションのクラスを削除（addClass ではなく removeClass のみ）
+Widget.js: イベントを受信してクラスを削除
     this.element.removeClass('writing-mode-vertical-rl');
     this.element.removeClass('writing-mode-horizontal-tb');
     ↓
 インタラクションは「クラスなし」状態になる
     ↓
-★ 新しいクラスは追加しない ★
+CSS継承でアイテムの設定に従う
+```
+
+**ポイント:** 新しいクラスは追加しない。クラスを削除するだけで継承が機能する。
+
+### 2. インタラクションのフォームを開いたとき
+
+```
+ユーザーがインタラクションを選択
     ↓
-以降、継承メカニズムが機能する
-```
+Question.js: クラスをチェック
 
-### 3. 継承が機能する2つの場所
-
-#### 3.1 CSS継承（表示・レンダリング）
-
-```css
-/* CSSのwriting-modeプロパティは親要素から継承される */
-.qti-itemBody.writing-mode-vertical-rl {
-    writing-mode: vertical-rl;
+if (interaction.hasClass('writing-mode-vertical-rl')) {
+    → ラジオボタン「縦書き」を選択
 }
-
-/* インタラクションにクラスがなければ、親の設定を継承 */
-.qti-choiceInteraction {
-    /* writing-mode: inherit; (デフォルト) */
+else if (interaction.hasClass('writing-mode-horizontal-tb')) {
+    → ラジオボタン「横書き」を選択
+}
+else {
+    → アイテムの設定に基づいてラジオボタンを選択
 }
 ```
 
-#### 3.2 フォーム表示（UI）
+**ポイント:** フォーム表示時にはクラスを追加しない。表示のみ。
 
-```javascript
-// Question.js: toggleVerticalWritingModeByLang
-if (interaction.hasClass(writingModeVerticalRlClass)) {
-    isVertical = true;  // 明示的に縦書き
-} else if (interaction.hasClass(writingModeHorizontalTbClass)) {
-    isVertical = false; // 明示的に横書き
-} else {
-    // ★ クラスなし = アイテムの設定を継承
-    isVertical = isItemVertical;
-}
+### 3. ユーザーがインタラクションの設定を変更したとき
 
-// フォームのラジオボタンを設定
-$form.find('input[name="writingMode"][value="vertical"]').prop('checked', isVertical);
-$form.find('input[name="writingMode"][value="horizontal"]').prop('checked', !isVertical);
+```
+ユーザーがラジオボタンを変更
+    ↓
+Question.js: callbacks.writingMode が実行
+
+1. 既存のクラスを削除
+
+2. アイテムと異なる設定の場合のみクラスを追加
+   - アイテムが横書き、選択が縦書き → class="writing-mode-vertical-rl" を追加
+   - アイテムが縦書き、選択が横書き → class="writing-mode-horizontal-tb" を追加
+   - アイテムと同じ設定 → クラスを追加しない（継承させる）
+```
+
+**ポイント:** アイテムと同じ設定ならクラスを追加しない（効率化）。
+
+---
+
+## 具体例
+
+### 例1: インタラクションが継承状態でアイテムを変更
+
+```
+【初期状態】
+アイテム: 横書き
+インタラクション: クラスなし → 横書き（継承）
+
+【操作】アイテムを縦書きに変更
+
+【処理】
+Widget.js: removeClass() → 変化なし（すでにクラスなし）
+
+【結果】
+アイテム: 縦書き
+インタラクション: クラスなし → 縦書き（継承）
+```
+
+### 例2: インタラクションに明示的設定がある状態でアイテムを変更
+
+```
+【初期状態】
+アイテム: 横書き
+インタラクション: class="writing-mode-vertical-rl" → 縦書き（明示的）
+
+【操作】アイテムを縦書きに変更
+
+【処理】
+Widget.js: removeClass('writing-mode-vertical-rl')
+→ クラスが削除される
+
+【結果】
+アイテム: 縦書き
+インタラクション: クラスなし → 縦書き（継承）
+```
+
+### 例3: インタラクションで親と異なる設定を選択
+
+```
+【初期状態】
+アイテム: 縦書き
+インタラクション: クラスなし → 縦書き（継承）
+
+【操作】インタラクションのフォームで「横書き」を選択
+
+【処理】
+Question.js: アイテム（縦書き）と選択（横書き）が異なる
+→ class="writing-mode-horizontal-tb" を追加
+
+【結果】
+アイテム: 縦書き
+インタラクション: class="writing-mode-horizontal-tb" → 横書き（明示的）
 ```
 
 ---
 
-## ソースコード詳細
-
-### Widget.js（アイテム変更時のイベントハンドラ）
-
-**ファイル:** `extension-tao-itemqti/views/js/qtiCreator/widgets/interactions/choiceInteraction/Widget.js`
-
-```javascript
-define([
-    'taoQtiItem/qtiCreator/widgets/interactions/Widget',
-    'taoQtiItem/qtiCreator/widgets/interactions/choiceInteraction/states/states',
-    'taoQtiItem/qtiCommonRenderer/helpers/sizeAdapter',
-    'taoQtiItem/qtiCreator/widgets/static/helpers/itemScrollingMethods',
-    'taoQtiItem/qtiCommonRenderer/helpers/verticalWriting'
-], function (Widget, states, sizeAdapter, itemScrollingMethods, verticalWriting) {
-    'use strict';
-
-    var ChoiceInteractionWidget = Widget.clone();
-
-    ChoiceInteractionWidget.initCreator = function () {
-        this.registerStates(states);
-        Widget.initCreator.call(this);
-
-        // ...
-
-        const $itemBody = this.$container.closest('.qti-itemBody');
-        $itemBody.on('item-writing-mode-changed', () => {
-            // ★ クラスを削除するだけ（追加はしない）
-            this.element.removeClass(verticalWriting.WRITING_MODE_VERTICAL_RL_CLASS);
-            this.element.removeClass(verticalWriting.WRITING_MODE_HORIZONTAL_TB_CLASS);
-            itemScrollingMethods.wrapContent(this, false, 'interaction');
-        });
-    };
-
-    return ChoiceInteractionWidget;
-});
-```
-
-### Question.js（フォーム初期化とコールバック）
-
-**ファイル:** `extension-tao-itemqti/views/js/qtiCreator/widgets/interactions/choiceInteraction/states/Question.js`
-
-#### フォーム初期化時の継承ロジック
-
-```javascript
-const toggleVerticalWritingModeByLang = (widget, $form, interaction) =>
-    verticalWritingEditing
-        .checkItemWritingMode(widget)
-        .then(({ isVerticalSupported, isItemVertical }) => {
-            // アイテムの設定を保存
-            $form.data('isItemVertical', isItemVertical);
-
-            let isVertical = null;
-
-            // 優先順位:
-            // 1. インタラクションの明示的設定（クラスあり）
-            // 2. アイテムの設定を継承（クラスなし）
-            if (interaction.hasClass(writingModeVerticalRlClass)) {
-                isVertical = true;
-            } else if (interaction.hasClass(writingModeHorizontalTbClass)) {
-                isVertical = false;
-            } else {
-                // ★ クラスなし = アイテムの設定を継承
-                isVertical = isItemVertical;
-            }
-
-            // フォームのラジオボタンを更新
-            $form.find('input[name="writingMode"][value="vertical"]').prop('checked', isVertical);
-            $form.find('input[name="writingMode"][value="horizontal"]').prop('checked', !isVertical);
-        });
-```
-
-#### ユーザーが設定を変更したときのコールバック
-
-```javascript
-callbacks.writingMode = function (i, mode) {
-    let isScrolling = false;
-
-    // 既存のクラスを削除
-    interaction.removeClass(writingModeVerticalRlClass);
-    interaction.removeClass(writingModeHorizontalTbClass);
-
-    // ★ アイテムと異なる設定の場合のみクラスを追加
-    if (mode === 'vertical' && !$form.data('isItemVertical')) {
-        // アイテムが横書き、インタラクションを縦書きに → クラス追加
-        interaction.addClass(writingModeVerticalRlClass);
-        isScrolling = true;
-    } else if (mode === 'horizontal' && $form.data('isItemVertical')) {
-        // アイテムが縦書き、インタラクションを横書きに → クラス追加
-        interaction.addClass(writingModeHorizontalTbClass);
-        isScrolling = true;
-    }
-    // ★ アイテムと同じ設定の場合はクラスを追加しない（継承させる）
-
-    itemScrollingMethods.initSelect($form, isScrolling);
-    itemScrollingMethods.wrapContent(widget, isScrolling, 'interaction');
-};
-```
-
----
-
-## Widgetライフサイクル
-
-### 初期化フロー
+## Widgetの初期化タイミング
 
 ```
 アイテムを開く
     ↓
-Renderer が全要素をレンダリング
+全インタラクションのWidgetが初期化される
     ↓
-各インタラクションに対して:
-    CreatorChoiceInteraction.render()
-        ↓
-    ChoiceInteractionWidget.build(interaction, container, ...)
-        ↓
-    Widget.init() が呼ばれる
-        ↓
-    initCreator() が呼ばれる（非同期）
-        ↓
-    'item-writing-mode-changed' イベントリスナーが登録される
+initCreator() で 'item-writing-mode-changed' イベントリスナーが登録される
 ```
 
-### 重要なポイント
-
-**アイテムを開いた時点で、全てのインタラクションのWidgetは即座に初期化されます。**
-
-インタラクションを「選択」する/しないに関係なく、イベントリスナーは**アイテムが開いている間は常にアクティブ**です。
+**重要:** Widgetはアイテムを開いた時点で初期化されます。インタラクションを「選択」するかどうかに関係なく、イベントリスナーは常にアクティブです。
 
 ---
 
 ## 設定値の永続化
 
-### removeClass() がどのように保存されるか
-
 ```
-removeClass() 呼び出し
+removeClass() / addClass() 呼び出し
     ↓
-内部で this.attr('class', newValue) を呼び出し
+内部で this.attr('class', value) を呼び出し
     ↓
-editable mixin の attr() がイベントを発火
-    $(document).trigger('attributeChange.qti-widget', {
-        element: this,
-        key: 'class',
-        value: newValue
-    });
-    ↓
-qtiXmlRenderer がこのイベントを検知
+editable mixin が attributeChange.qti-widget イベントを発火
     ↓
 QTI XMLに自動保存
 ```
 
 ---
 
-## 動作シナリオ
-
-### シナリオ1: インタラクションが継承状態 → アイテム変更
-
-```
-初期状態:
-  アイテム: 横書き
-  インタラクション: クラスなし（継承 → 横書き）
-
-操作: アイテムを縦書きに変更
-
-処理:
-  1. Active.js: item-writing-mode-changed イベント発火
-  2. Widget.js: removeClass() 呼び出し（すでにクラスなしなので変化なし）
-
-結果:
-  アイテム: 縦書き
-  インタラクション: クラスなし（継承 → 縦書き）
-```
-
-### シナリオ2: インタラクションが明示的設定あり → アイテム変更
-
-```
-初期状態:
-  アイテム: 横書き
-  インタラクション: class="writing-mode-vertical-rl"（明示的に縦書き）
-
-操作: アイテムを縦書きに変更
-
-処理:
-  1. Active.js: item-writing-mode-changed イベント発火
-  2. Widget.js: removeClass('writing-mode-vertical-rl') 呼び出し
-  3. インタラクションのクラスが削除される
-  4. attributeChange.qti-widget イベント発火
-  5. QTI XMLに保存
-
-結果:
-  アイテム: 縦書き
-  インタラクション: クラスなし（継承 → 縦書き）
-```
-
-### シナリオ3: インタラクションのフォームを開く
-
-```
-状態:
-  アイテム: 縦書き
-  インタラクション: クラスなし
-
-操作: インタラクションを選択してフォームを開く
-
-処理:
-  1. Question.js: toggleVerticalWritingModeByLang() 呼び出し
-  2. interaction.hasClass() チェック → 両方 false
-  3. isItemVertical = true を使用
-  4. フォームのラジオボタン: 縦書きが選択状態
-
-結果:
-  フォームには「縦書き」が表示される
-  ★ この時点ではクラスは追加されない
-```
-
----
-
 ## QTI XMLでの保存形式
 
-### アイテムレベルの設定
-
 ```xml
-<assessmentItem class="writing-mode-vertical-rl" ...>
+<!-- アイテムの設定 -->
+<assessmentItem class="writing-mode-vertical-rl">
     <itemBody>
-        ...
+
+        <!-- 継承の場合（クラスなし） -->
+        <choiceInteraction responseIdentifier="RESPONSE">
+            ...
+        </choiceInteraction>
+
+        <!-- 明示的設定の場合 -->
+        <choiceInteraction class="writing-mode-horizontal-tb" responseIdentifier="RESPONSE">
+            ...
+        </choiceInteraction>
+
     </itemBody>
 </assessmentItem>
 ```
 
-### インタラクションレベルの設定
+---
 
-```xml
-<!-- 明示的設定がある場合（アイテムと異なる設定） -->
-<choiceInteraction class="writing-mode-horizontal-tb" ...>
-    ...
-</choiceInteraction>
+## 関連ソースコード
 
-<!-- 継承の場合（クラスなし） -->
-<choiceInteraction responseIdentifier="RESPONSE" ...>
-    ...
-</choiceInteraction>
-```
+| ファイル | 役割 |
+|----------|------|
+| `choiceInteraction/Widget.js` | アイテム変更時にクラスを削除 |
+| `choiceInteraction/states/Question.js` | フォーム表示とユーザー操作の処理 |
+| `item/states/Active.js` | アイテム設定変更時にイベント発火 |
+| `qtiCreator/model/mixin/editable.js` | attr()でattributeChangeイベント発火 |
 
 ---
 
-## PCIでの実装方針
+## PCIへの適用
 
-### 標準インタラクションと同様の動作を実現する場合
+### 実装に必要な要素
 
-#### 1. Widget.js でイベントリスナーを登録
+1. **Widget.js**: `item-writing-mode-changed`イベントリスナーを登録し、クラスを削除
+2. **Question.js**: クラスを確認してフォーム表示、変更時にクラスを追加/削除
 
-```javascript
-PCIWidget.initCreator = function() {
-    Widget.initCreator.call(this);
+### 検証が必要な項目
 
-    const $itemBody = this.$container.closest('.qti-itemBody');
-    $itemBody.on('item-writing-mode-changed', () => {
-        // クラスを削除するだけ（追加はしない）
-        this.element.removeClass('writing-mode-vertical-rl');
-        this.element.removeClass('writing-mode-horizontal-tb');
-    });
-};
-```
-
-#### 2. Question.js で継承ロジックを実装
-
-```javascript
-// フォーム初期化時
-const initWritingMode = (pciElement, isItemVertical) => {
-    let isVertical;
-
-    if (pciElement.hasClass('writing-mode-vertical-rl')) {
-        isVertical = true;  // 明示的に縦書き
-    } else if (pciElement.hasClass('writing-mode-horizontal-tb')) {
-        isVertical = false; // 明示的に横書き
-    } else {
-        isVertical = isItemVertical; // ★ クラスなし = アイテムの設定を継承
-    }
-
-    return isVertical;
-};
-```
-
-#### 3. コールバックでの最適化
-
-```javascript
-callbacks.writingMode = function(i, mode) {
-    const isItemVertical = $form.data('isItemVertical');
-
-    // 既存のクラスを削除
-    pciElement.removeClass('writing-mode-vertical-rl');
-    pciElement.removeClass('writing-mode-horizontal-tb');
-
-    // ★ アイテムと異なる設定の場合のみクラスを追加
-    if (mode === 'vertical' && !isItemVertical) {
-        pciElement.addClass('writing-mode-vertical-rl');
-    } else if (mode === 'horizontal' && isItemVertical) {
-        pciElement.addClass('writing-mode-horizontal-tb');
-    }
-    // アイテムと同じ設定の場合はクラスを追加しない（継承させる）
-};
-```
-
----
-
-## PCIでの実装上の懸念点
-
-### 1. this.element の動作確認が必要
-
-PCIの `this.element` が editable mixin を持ち、`attributeChange.qti-widget` イベントをトリガーするか要検証。
-
-### 2. QTI XMLへのclass属性保存
-
-PCIの `<customInteraction>` 要素に class 属性が正しく保存されるか要検証。
-
-### 3. CSS継承
-
-PCIの内部DOMにCSSの `writing-mode` が正しく継承されるか要検証。
-
----
-
-## まとめ
-
-### 標準インタラクションの設計思想
-
-1. **クラスなし = 継承** という設計
-2. アイテム変更時は**クラス削除のみ**（新しい値を書き込まない）
-3. 継承は**CSS継承**と**フォームロジック**の両方で実現
-
-### PCIで同等の実装をする場合
-
-同じ設計パターンを適用可能ですが、以下の点を事前に検証することを推奨：
-
-- [ ] `this.element.addClass/removeClass` が動作するか
-- [ ] `attributeChange.qti-widget` イベントがトリガーされるか
-- [ ] QTI XMLにclass属性が保存されるか
-- [ ] CSS `writing-mode` がPCI内部に継承されるか
-
----
-
-## 参考リンク
-
-- [choiceInteraction Widget.js (GitHub)](https://github.com/oat-sa/extension-tao-itemqti/blob/master/views/js/qtiCreator/widgets/interactions/choiceInteraction/Widget.js)
-- [choiceInteraction Question.js (GitHub)](https://github.com/oat-sa/extension-tao-itemqti/blob/master/views/js/qtiCreator/widgets/interactions/choiceInteraction/states/Question.js)
-- [editable mixin (GitHub)](https://github.com/oat-sa/extension-tao-itemqti/blob/master/views/js/qtiCreator/model/mixin/editable.js)
-- [Element.js - addClass/removeClass (GitHub)](https://github.com/oat-sa/tao-item-runner-qti-fe/blob/master/src/qtiItem/core/Element.js)
+- [ ] PCIの`this.element.addClass/removeClass`が動作するか
+- [ ] PCIの`<customInteraction>`要素にclass属性が保存されるか
+- [ ] CSS `writing-mode`がPCI内部に継承されるか
