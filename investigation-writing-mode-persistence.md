@@ -1,104 +1,235 @@
-# Writing-Mode 継承メカニズム調査レポート
+# PCI 文字列方向設定 実装ガイド
 
-## 概要
+## 目的
 
-標準インタラクション（choiceInteraction等）における文字列方向（writing-mode）設定の継承メカニズムを調査しました。
-
----
-
-## 設定値の保存形式
-
-インタラクションのwriting-mode設定は**クラス属性**として保存されます。
-
-| クラス属性 | 意味 |
-|-----------|------|
-| `class="writing-mode-vertical-rl"` | 明示的に縦書き |
-| `class="writing-mode-horizontal-tb"` | 明示的に横書き |
-| クラスなし | アイテムの設定を継承 |
+PCIに標準インタラクションと同等の文字列方向（writing-mode）設定機能を追加する。
 
 ---
 
-## 継承の仕組み
+## 標準インタラクションの仕組み（参考）
 
-### 基本原則
+### 設定値の保存
 
-**「クラスなし」=「親（アイテム）に従う」**
+標準インタラクションは**クラス属性**で設定を保存します。
 
-### 継承が機能する場所
+| 状態 | クラス属性 |
+|------|-----------|
+| 縦書き（明示的） | `class="writing-mode-vertical-rl"` |
+| 横書き（明示的） | `class="writing-mode-horizontal-tb"` |
+| 継承 | クラスなし |
 
-| 場所 | 機能 |
-|------|------|
-| CSS | `writing-mode`プロパティが親要素から子要素に継承される |
-| フォーム表示 | Question.jsがクラスを確認し、なければアイテムの設定を使用 |
+### 継承の仕組み
+
+- **クラスなし = アイテムの設定を継承**
+- アイテム変更時: インタラクションのクラスを削除 → 継承状態になる
+- CSS継承とフォームロジックの両方で継承が機能
 
 ---
 
-## インタラクションの設定保存ルール
+## PCIでの実装方針
 
-### いつ保存されるか
+### 設定値の保存
 
-| アイテムの設定 | インタラクションの選択 | 保存される？ | 理由 |
-|---------------|---------------------|-------------|------|
-| 横書き | 横書き | ❌ しない | 継承で同じ結果になる |
-| 横書き | 縦書き | ✅ する | アイテムと異なる |
-| 縦書き | 横書き | ✅ する | アイテムと異なる |
-| 縦書き | 縦書き | ❌ しない | 継承で同じ結果になる |
+PCIは**プロパティ**で設定を保存します。
 
-### コードでの実装
+| 状態 | プロパティ |
+|------|-----------|
+| 縦書き（明示的） | `writingMode: 'vertical'` |
+| 横書き（明示的） | `writingMode: 'horizontal'` |
+| 継承 | プロパティなし（または`undefined`） |
+
+### QTI XMLでの保存形式
+
+```xml
+<customInteraction responseIdentifier="RESPONSE">
+    <pci:portableCustomInteraction customInteractionTypeIdentifier="myPci">
+        <pci:properties>
+            <!-- 明示的設定がある場合のみ保存 -->
+            <pci:entry key="writingMode">vertical</pci:entry>
+            <!-- その他のプロパティ -->
+            <pci:entry key="otherProp">value</pci:entry>
+        </pci:properties>
+        <pci:markup>...</pci:markup>
+    </pci:portableCustomInteraction>
+</customInteraction>
+```
+
+---
+
+## 実装詳細
+
+### 1. プロパティ操作メソッド
 
 ```javascript
-// Question.js: callbacks.writingMode
+// プロパティの設定
+this.element.prop('writingMode', 'vertical');
 
-// 1. まず既存のクラスを削除
-interaction.removeClass('writing-mode-vertical-rl');
-interaction.removeClass('writing-mode-horizontal-tb');
+// プロパティの取得
+const mode = this.element.prop('writingMode');  // 'vertical' or undefined
 
-// 2. アイテムと異なる場合のみクラスを追加
-if (mode === 'vertical' && !isItemVertical) {
-    // アイテムが横書き、選択が縦書き → 保存する
-    interaction.addClass('writing-mode-vertical-rl');
-}
-else if (mode === 'horizontal' && isItemVertical) {
-    // アイテムが縦書き、選択が横書き → 保存する
-    interaction.addClass('writing-mode-horizontal-tb');
-}
-// それ以外（アイテムと同じ設定）→ 何も追加しない（継承させる）
+// 全プロパティの取得
+const allProps = this.element.getProperties();
+```
+
+### 2. プロパティの削除（注意）
+
+**`removeProp()`メソッドにはバグがあります。** 代わりに以下の方法を使用してください。
+
+```javascript
+// 方法1: undefined を設定
+this.element.prop('writingMode', undefined);
+
+// 方法2: 直接削除
+delete this.element.properties['writingMode'];
+```
+
+---
+
+## 実装コード例
+
+### Widget.js（アイテム変更時の処理）
+
+```javascript
+define([
+    'taoQtiItem/qtiCreator/widgets/interactions/customInteraction/Widget',
+    'myPci/creator/widget/states/states'
+], function(Widget, states) {
+    'use strict';
+
+    var MyPciWidget = Widget.clone();
+
+    MyPciWidget.initCreator = function() {
+        this.registerStates(states);
+        Widget.initCreator.call(this);
+
+        // アイテムの文字列方向変更を監視
+        var self = this;
+        var $itemBody = this.$container.closest('.qti-itemBody');
+
+        $itemBody.on('item-writing-mode-changed', function() {
+            // プロパティを削除して継承状態にする
+            self.element.prop('writingMode', undefined);
+            // または: delete self.element.properties['writingMode'];
+        });
+    };
+
+    return MyPciWidget;
+});
+```
+
+### Question.js（フォーム処理）
+
+```javascript
+define([
+    'taoQtiItem/qtiCreator/widgets/states/lib/formElement',
+    'taoQtiItem/qtiCreator/widgets/static/helpers/verticalWritingEditing'
+], function(formElement, verticalWritingEditing) {
+    'use strict';
+
+    var QuestionState = stateFactory.extend(Question, function() {
+        var widget = this.widget;
+        var interaction = widget.element;
+        var $form = widget.$form;
+
+        // アイテムの設定を取得
+        verticalWritingEditing.checkItemWritingMode(widget)
+            .then(function(result) {
+                var isItemVertical = result.isItemVertical;
+                $form.data('isItemVertical', isItemVertical);
+
+                // インタラクションの設定を判定
+                var writingMode = interaction.prop('writingMode');
+                var isVertical;
+
+                if (writingMode === 'vertical') {
+                    isVertical = true;
+                } else if (writingMode === 'horizontal') {
+                    isVertical = false;
+                } else {
+                    // プロパティなし → アイテムの設定を継承
+                    isVertical = isItemVertical;
+                }
+
+                // ラジオボタンを設定
+                $form.find('input[name="writingMode"][value="vertical"]')
+                    .prop('checked', isVertical);
+                $form.find('input[name="writingMode"][value="horizontal"]')
+                    .prop('checked', !isVertical);
+            });
+
+        // コールバック設定
+        var callbacks = {
+            writingMode: function(i, mode) {
+                var isItemVertical = $form.data('isItemVertical');
+
+                if ((mode === 'vertical' && isItemVertical) ||
+                    (mode === 'horizontal' && !isItemVertical)) {
+                    // アイテムと同じ設定 → プロパティを削除（継承させる）
+                    interaction.prop('writingMode', undefined);
+                } else {
+                    // アイテムと異なる設定 → プロパティを保存
+                    interaction.prop('writingMode', mode);
+                }
+            }
+        };
+
+        formElement.initDataBinding($form, interaction, callbacks);
+    });
+
+    return QuestionState;
+});
+```
+
+### フォームテンプレート（tpl）
+
+```html
+<div class="panel writingMode-panel">
+    <h3>{{__ "Direction of writing"}}</h3>
+    <div>
+        <label class="smaller-prompt">
+            <input type="radio" name="writingMode" value="horizontal" />
+            <span class="icon-radio"></span>
+            {{__ "Horizontal text"}}
+        </label>
+        <br>
+        <label class="smaller-prompt">
+            <input type="radio" name="writingMode" value="vertical" />
+            <span class="icon-radio"></span>
+            {{__ "Vertical text"}}
+        </label>
+    </div>
+</div>
 ```
 
 ---
 
 ## 処理フロー
 
-### 1. アイテムのwriting-modeが変更されたとき
+### 1. アイテムの文字列方向が変更されたとき
 
 ```
 ユーザーがアイテムの設定を変更
     ↓
-Active.js: イベント発火
-    $itemBody.trigger('item-writing-mode-changed')
+Active.js: $itemBody.trigger('item-writing-mode-changed')
     ↓
-Widget.js: イベントを受信してクラスを削除
-    this.element.removeClass('writing-mode-vertical-rl');
-    this.element.removeClass('writing-mode-horizontal-tb');
+Widget.js: イベントを受信
     ↓
-インタラクションは「クラスなし」状態になる
+interaction.prop('writingMode', undefined) でプロパティを削除
     ↓
-CSS継承でアイテムの設定に従う
+PCIは「継承」状態になる
 ```
 
-**ポイント:** 新しいクラスは追加しない。クラスを削除するだけで継承が機能する。
-
-### 2. インタラクションのフォームを開いたとき
+### 2. PCIのフォームを開いたとき
 
 ```
-ユーザーがインタラクションを選択
+ユーザーがPCIを選択
     ↓
-Question.js: クラスをチェック
+Question.js: プロパティをチェック
 
-if (interaction.hasClass('writing-mode-vertical-rl')) {
+if (prop('writingMode') === 'vertical') {
     → ラジオボタン「縦書き」を選択
 }
-else if (interaction.hasClass('writing-mode-horizontal-tb')) {
+else if (prop('writingMode') === 'horizontal') {
     → ラジオボタン「横書き」を選択
 }
 else {
@@ -106,167 +237,78 @@ else {
 }
 ```
 
-**ポイント:** フォーム表示時にはクラスを追加しない。ラジオボタンの表示のみ。
-
-### 3. ユーザーがインタラクションの設定を変更したとき
+### 3. ユーザーがPCIの設定を変更したとき
 
 ```
 ユーザーがラジオボタンを変更
     ↓
-Question.js: callbacks.writingMode が実行
+callbacks.writingMode が実行
     ↓
-1. 既存のクラスを削除
-2. アイテムと異なる設定の場合のみクラスを追加
+アイテムと同じ設定？
+    ├─ YES → プロパティを削除（継承させる）
+    └─ NO  → プロパティを保存
 ```
 
 ---
 
-## 具体例
+## 保存ルール
 
-### 例1: インタラクションが継承状態でアイテムを変更
-
-```
-【初期状態】
-アイテム: 横書き
-インタラクション: クラスなし → 横書き（継承）
-
-【操作】アイテムを縦書きに変更
-
-【処理】
-Widget.js: removeClass() → 変化なし（すでにクラスなし）
-
-【結果】
-アイテム: 縦書き
-インタラクション: クラスなし → 縦書き（継承）
-```
-
-### 例2: インタラクションに明示的設定がある状態でアイテムを変更
-
-```
-【初期状態】
-アイテム: 横書き
-インタラクション: class="writing-mode-vertical-rl" → 縦書き（明示的）
-
-【操作】アイテムを縦書きに変更
-
-【処理】
-Widget.js: removeClass('writing-mode-vertical-rl')
-→ クラスが削除される
-
-【結果】
-アイテム: 縦書き
-インタラクション: クラスなし → 縦書き（継承）
-```
-
-### 例3: インタラクションで親と異なる設定を選択
-
-```
-【初期状態】
-アイテム: 縦書き
-インタラクション: クラスなし → 縦書き（継承）
-
-【操作】インタラクションのフォームで「横書き」を選択
-
-【処理】
-Question.js: アイテム（縦書き）と選択（横書き）が異なる
-→ class="writing-mode-horizontal-tb" を追加
-
-【結果】
-アイテム: 縦書き
-インタラクション: class="writing-mode-horizontal-tb" → 横書き（明示的）
-```
-
-### 例4: インタラクションで親と同じ設定を選択
-
-```
-【初期状態】
-アイテム: 縦書き
-インタラクション: class="writing-mode-horizontal-tb" → 横書き（明示的）
-
-【操作】インタラクションのフォームで「縦書き」を選択
-
-【処理】
-Question.js: アイテム（縦書き）と選択（縦書き）が同じ
-→ クラスを追加しない
-
-【結果】
-アイテム: 縦書き
-インタラクション: クラスなし → 縦書き（継承）
-```
+| アイテムの設定 | PCIの選択 | 保存される？ | 理由 |
+|---------------|----------|-------------|------|
+| 横書き | 横書き | ❌ しない | 継承で同じ結果 |
+| 横書き | 縦書き | ✅ する | アイテムと異なる |
+| 縦書き | 横書き | ✅ する | アイテムと異なる |
+| 縦書き | 縦書き | ❌ しない | 継承で同じ結果 |
 
 ---
 
-## Widgetの初期化タイミング
+## 標準インタラクションとPCIの比較
 
-```
-アイテムを開く
-    ↓
-全インタラクションのWidgetが初期化される
-    ↓
-initCreator() で 'item-writing-mode-changed' イベントリスナーが登録される
-```
-
-**重要:** Widgetはアイテムを開いた時点で初期化されます。インタラクションを「選択」するかどうかに関係なく、イベントリスナーは常にアクティブです。
+| 項目 | 標準インタラクション | PCI |
+|------|-------------------|-----|
+| 保存場所 | クラス属性 | プロパティ |
+| 設定方法 | `addClass()` | `prop()` |
+| 削除方法 | `removeClass()` | `prop(name, undefined)` |
+| 継承状態 | クラスなし | プロパティなし |
+| XML保存 | 要素のclass属性 | `<pci:properties>` |
 
 ---
 
-## 設定値の永続化
+## 実装チェックリスト
 
-```
-removeClass() / addClass() 呼び出し
-    ↓
-内部で this.attr('class', value) を呼び出し
-    ↓
-editable mixin が attributeChange.qti-widget イベントを発火
-    ↓
-QTI XMLに自動保存
-```
+### Widget.js
+- [ ] `item-writing-mode-changed` イベントリスナーを登録
+- [ ] イベント受信時に `prop('writingMode', undefined)` でプロパティを削除
 
----
+### Question.js
+- [ ] `verticalWritingEditing.checkItemWritingMode()` でアイテムの設定を取得
+- [ ] `prop('writingMode')` で現在の設定を確認
+- [ ] プロパティがなければアイテムの設定を継承
+- [ ] ラジオボタンの状態を設定
+- [ ] `callbacks.writingMode` で変更時の処理を実装
+- [ ] アイテムと同じ設定ならプロパティを削除
 
-## QTI XMLでの保存形式
-
-```xml
-<!-- アイテムの設定 -->
-<assessmentItem class="writing-mode-vertical-rl">
-    <itemBody>
-
-        <!-- 継承の場合（クラスなし） -->
-        <choiceInteraction responseIdentifier="RESPONSE">
-            ...
-        </choiceInteraction>
-
-        <!-- 明示的設定の場合 -->
-        <choiceInteraction class="writing-mode-horizontal-tb" responseIdentifier="RESPONSE">
-            ...
-        </choiceInteraction>
-
-    </itemBody>
-</assessmentItem>
-```
+### テンプレート
+- [ ] writing-mode用のラジオボタンを追加
 
 ---
 
-## 関連ソースコード
+## 注意事項
 
-| ファイル | 役割 |
-|----------|------|
-| `choiceInteraction/Widget.js` | アイテム変更時にクラスを削除 |
-| `choiceInteraction/states/Question.js` | フォーム表示とユーザー操作の処理 |
-| `item/states/Active.js` | アイテム設定変更時にイベント発火 |
-| `qtiCreator/model/mixin/editable.js` | attr()でattributeChangeイベント発火 |
+### removeProp() のバグについて
 
----
+`CustomElement.js` の `removeProp()` メソッドは `this.attributes` を削除するバグがあります。
+プロパティを削除する場合は、以下のいずれかを使用してください。
 
-## PCIへの適用
+```javascript
+// 推奨: undefined を設定
+this.element.prop('writingMode', undefined);
 
-### 実装に必要な要素
+// 代替: 直接削除
+delete this.element.properties['writingMode'];
+```
 
-1. **Widget.js**: `item-writing-mode-changed`イベントリスナーを登録し、クラスを削除
-2. **Question.js**: クラスを確認してフォーム表示、アイテムと異なる場合のみクラスを追加
+### CSS継承について
 
-### 検証が必要な項目
-
-- [ ] PCIの`this.element.addClass/removeClass`が動作するか
-- [ ] PCIの`<customInteraction>`要素にclass属性が保存されるか
-- [ ] CSS `writing-mode`がPCI内部に継承されるか
+PCI内部のDOMに対してCSSの `writing-mode` プロパティが正しく継承されるか確認が必要です。
+PCI内部で独自のスタイルを適用している場合、継承が機能しない可能性があります。
