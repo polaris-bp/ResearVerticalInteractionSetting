@@ -6,6 +6,138 @@
 
 ---
 
+## 0. 前提確認: クラス方式はPCIで実現可能か？
+
+**結論: 可能。** ソースコードで全経路を確認済み。
+
+### QTI仕様
+
+QTI 2.1/2.2 仕様において、`customInteraction`は`bodyElement`を継承しており、`bodyElement`は`class`属性を定義している。したがって `<customInteraction class="writing-mode-vertical-rl">` は**QTI仕様に準拠**している。
+
+### 全経路の検証（ソースコード根拠）
+
+`class`属性がSave → Load の完全なラウンドトリップを生き残るか、6段階すべてを確認した。
+
+#### ① PHP XML パース（ロード時）
+
+**ソース:** `extension-tao-itemqti/model/qti/ParserFactory.php` — `extractAttributes()`
+
+```php
+protected function extractAttributes(DOMElement $data)
+{
+    $options = [];
+    foreach ($data->attributes as $attr) {
+        if ($attr->nodeName === 'xsi:schemaLocation') { continue; }
+        $options[$this->attributeMap[$attr->nodeName] ?? $attr->nodeName] = (string) $attr->nodeValue;
+    }
+    return $options;
+}
+```
+
+`xsi:schemaLocation`以外の**全DOM属性**を抽出する。`class`もここで取得される。
+
+#### ② PHP モデルへの格納
+
+**ソース:** `extension-tao-itemqti/model/qti/Element.php` — `setAttribute()`
+
+`Interaction`の`getUsedAttributes()`は`ResponseIdentifier`のみを返す。`class`は既知属性に含まれないため、`Generic`属性オブジェクトとして格納される：
+
+```php
+} else {
+    $this->attributes[$name] = new Generic($value);
+}
+```
+
+#### ③ PHP → JSON シリアライズ
+
+**ソース:** `Element.php` — `getAttributeValues()`
+
+```php
+public function getAttributeValues($filterNull = true)
+{
+    $returnValue = [];
+    foreach ($this->attributes as $name => $attribute) {
+        if (!$filterNull || !$attribute->isNull()) {
+            $returnValue[$name] = $attribute->getValue();
+        }
+    }
+    return $returnValue;
+}
+```
+
+全属性（`responseIdentifier`と`class`を含む）がJSON出力に含まれる。
+
+#### ④ JS モデルへのロード
+
+**ソース:** `tao-item-runner-qti-fe/src/qtiItem/core/Loader.js` — `loadElementData()`
+
+```javascript
+const attributes = _.defaults(data.attributes || {}, element.attributes || {});
+element.setAttributes(attributes);
+```
+
+**ソース:** `Element.js` — `setAttributes()`
+
+```javascript
+setAttributes: function (attributes) {
+    this.attributes = attributes;  // ← フィルタリングなし、そのまま代入
+    return this;
+}
+```
+
+`class`を含む全属性がフィルタリングなしでJSモデルに格納される。
+
+#### ⑤ JS → XML レンダリング（保存時）
+
+**ソース:** `extension-tao-itemqti/views/js/qtiXmlRenderer` のテンプレート
+
+```handlebars
+<customInteraction {{{join attributes '=' ' ' '"'}}}>
+    {{{portableCustomInteraction}}}
+</customInteraction>
+```
+
+`{{{join attributes ...}}}`は`this.getAttributes()`の全キーバリューペアをXML属性文字列に変換する。`class`も含まれる。
+
+#### ⑥ PHP XML シリアライズ（保存時）
+
+**ソース:** `Element.php` — `xmlizeOptions()`
+
+```php
+foreach ($options as $key => $value) {
+    if (is_string($value) || is_numeric($value)) {
+        $returnValue .= ' ' . $key . '="' . htmlspecialchars($value) . '"';
+    }
+}
+```
+
+**出力結果:** `<customInteraction class="writing-mode-vertical-rl" responseIdentifier="RESPONSE">`
+
+### 実績: audioRecordingInteraction (IMS版)
+
+**ソース:** `extension-tao-itemqti-pci/views/js/pciCreator/ims/audioRecordingInteraction/creator/widget/states/Question.js`
+
+```javascript
+interaction.toggleClass('sequential', value);
+```
+
+このPCIは実際に`toggleClass()`でクラス属性を操作しており、Save/Loadサイクルを通じて`class`属性が永続化されている。これは**クラス方式がPCIで動作する実証**である。
+
+### まとめ
+
+| 経路 | class属性の扱い | ソース |
+|------|----------------|--------|
+| XML → PHP パース | `extractAttributes()`で抽出 | `ParserFactory.php` |
+| PHP モデル格納 | `Generic`属性として格納 | `Element.php` |
+| PHP → JSON | `getAttributeValues()`で出力 | `Element.php` |
+| JSON → JS モデル | フィルタリングなしで格納 | `Loader.js`, `Element.js` |
+| JS → XML レンダリング | `{{{join attributes}}}`で出力 | テンプレート |
+| PHP → XML | `xmlizeOptions()`で出力 | `Element.php` |
+
+**全6段階でclass属性はフィルタリング・除去されることなく通過する。**
+
+---
+
 ## 検証結果サマリー
 
 | ユーザーの主張 | 検証結果 | 根拠 |
